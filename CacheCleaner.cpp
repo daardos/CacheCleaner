@@ -1,49 +1,27 @@
 /*
  * =========================================================================
- *  МЕГА-ОЧИСТЧИК КЭШЕЙ (DEVELOPER EDITION) - v13.0 SAFE_REV
+ *  МЕГА-ОЧИСТЧИК КЭШЕЙ (DEVELOPER EDITION) - v13.0 SAFE_EDITION
  * =========================================================================
  *
  *  Утилита для безопасной очистки кэшей (npm, pip, gradle), браузеров и системы.
  *  Также умеет сжимать виртуальные диски WSL2/Docker (VHDX).
  *
  *  ОСОБЕННОСТИ:
- *  - Уровни доверия: [SAFE] (кэши браузеров), [REBUILD] (пакетные менеджеры),
- *    [DATA] (модели Ollama - требуют отдельного подтверждения).
- *  - Защита от удаления системных папок и корня профиля пользователя
- *    (пути берутся из переменных окружения, а не хардкодом под C:\).
- *  - Полная защита от reparse points (junctions/symlinks): точки соединения
- *    не обходятся и не удаляются рекурсивно - только снимается сама ссылка.
+ *  - Уровни доверия: [SAFE] (кэши браузеров), [REBUILD] (пакетные менеджеры).
+ *  - Защита от удаления пользовательских данных (модели Ollama, настройки ПО).
+ *  - Защита от удаления системных папок и корня профиля пользователя.
  *  - Понимает UTF-16LE и UTF-8 (включая WSL_UTF8=1).
- *  - Предупреждает, если браузер/Discord/VS Code запущены (кэш будет залочен).
- *  - Использует Job Objects и CREATE_SUSPENDED для безопасного ожидания
+ *  - Использует Job Objects и CREATE_SUSPENDED для безопасного убийства 
  *    зависших процессов (Optimize-VHD) без утечки хэндлов.
- *  - Честная статистика: освобождённое место вычисляется по факту
- *    (размер до минус размер после), включая вложенные папки.
- *
- *  ИЗМЕНЕНИЯ v13.0 относительно v12.2:
- *  1. Функция GetFreeSpace переименована в GetFreeBytesOnVolume
- *     (GetFreeSpace - макрос Windows, ломал сборку MinGW).
- *  2. FOLDERID_Desktop определён локально - флаг -luuid больше не нужен.
- *  3. IsSafePath: системные пути берутся из SystemRoot/ProgramFiles/
- *     ProgramFiles(x86)/ProgramData, а не хардкодом c:\...
- *  4. Reparse-point защита в GetSize/CleanPath (junctions под MinGW
- *     не распознаются is_symlink и раньше могли привести к удалению
- *     содержимого за пределами целевой папки).
- *  5. CleanPath корректно считает освобождённое место в подпапках.
- *  6. Удалена цель "PS Media Cache" (Adobe\Photoshop\CT) - не подтверждено,
- *     что это кэш.
- *  7. Предупреждение о запущенных браузерах/Discord/VS Code.
  *
  *  ИЗВЕСТНЫЕ ОГРАНИЧЕНИЯ (README):
- *  1. Сжатие VHDX требует Windows Pro/Enterprise (наличие Hyper-V).
+ *  1. Сжатие VHDX требует Windows Pro/Enterprise (наличие Hyper-V). 
  *     На Windows Home модуль Hyper-V отсутствует, программа вежливо пропустит шаг.
  *  2. Если утилита запущена внутри другого Job Object (отладчик, CI-агент),
  *     привязка может не сработать. Программа выдаст [WARN], но продолжит работу.
- *  3. Поддерживается WSL_UTF8=1. Другие значения переменной WSL_UTF8
+ *  3. Поддерживается WSL_UTF8=1. Другие значения переменной WSL_UTF8 
  *     (например, TRUE) могут привести к неверному парсингу имен дистрибутивов.
- *  4. REBUILD-цели (.m2, .nuget, .gradle) перекачиваются из сети -
- *     офлайн-сборка после очистки сломается.
- *
+ * 
  *  СБОРКА:
  *  MinGW: g++ -std=c++17 CacheCleaner.cpp -o cleaning.exe -lole32 -lshell32 -ladvapi32
  *  MSVC:  cl /std:c++17 /EHsc CacheCleaner.cpp   (pragma comment(lib,...) уже в коде)
@@ -58,7 +36,6 @@
 #include <iomanip>
 #include <sstream>
 #include <windows.h>
-#include <tlhelp32.h>
 #include <shlobj.h>
 #include <fstream>
 #include <algorithm>
@@ -79,7 +56,7 @@ constexpr DWORD PROCESS_LAUNCH_FAILED = 0xFFFFFFFE;
 constexpr DWORD PROCESS_TIMEOUT_CODE  = 0xFFFFFFFF;
 
 enum class Trust {
-    SAFE, REBUILDABLE, DATA
+    SAFE, REBUILDABLE
 };
 
 struct CacheTarget {
@@ -89,11 +66,6 @@ struct CacheTarget {
     uintmax_t size_before = 0;
     uintmax_t size_after = 0;
 };
-
-// FOLDERID_Desktop (B4BFCC3A-DB2C-424C-B029-7FE99A87C641).
-// Определён локально, чтобы MinGW-сборке не требовался -luuid.
-static const GUID kFolderIdDesktop =
-    {0xB4BFCC3A, 0xDB2C, 0x424C, {0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41}};
 
 // --- Утилиты ---
 
@@ -140,12 +112,11 @@ std::string TrustToString(Trust t) {
     switch (t) {
         case Trust::SAFE: return "[SAFE]";
         case Trust::REBUILDABLE: return "[REBUILD]";
-        case Trust::DATA: return "[DATA]";
     }
     return "";
 }
 
-uintmax_t GetFreeBytesOnVolume(const fs::path& p) {
+uintmax_t GetFreeSpace(const fs::path& p) {
     wchar_t volumePath[MAX_PATH];
     if (GetVolumePathNameW(p.wstring().c_str(), volumePath, MAX_PATH)) {
         ULARGE_INTEGER freeBytesAvailable;
@@ -154,28 +125,6 @@ uintmax_t GetFreeBytesOnVolume(const fs::path& p) {
         }
     }
     return 0;
-}
-
-// Надёжная проверка reparse point (symlink ИЛИ junction) через WinAPI.
-// std::filesystem::is_symlink под MinGW junction может не распознавать.
-bool IsReparsePoint(const fs::path& p) {
-    DWORD attrs = GetFileAttributesW(p.wstring().c_str());
-    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT);
-}
-
-bool IsProcessRunning(const std::wstring& exeName) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return false;
-    PROCESSENTRY32W pe;
-    pe.dwSize = sizeof(pe);
-    bool found = false;
-    if (Process32FirstW(snap, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, exeName.c_str()) == 0) { found = true; break; }
-        } while (Process32NextW(snap, &pe));
-    }
-    CloseHandle(snap);
-    return found;
 }
 
 // --- Безопасность и WinAPI ---
@@ -194,7 +143,7 @@ bool IsAdmin() {
 
 DWORD RunProcess(const std::wstring& cmdLine, DWORD timeoutMs = INFINITE) {
     if (cmdLine.empty()) return PROCESS_LAUNCH_FAILED;
-
+    
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -227,18 +176,18 @@ DWORD RunProcess(const std::wstring& cmdLine, DWORD timeoutMs = INFINITE) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
-
+    
     if (hJob) CloseHandle(hJob);
     return exitCode;
 }
 
 std::string RunProcessCapture(const std::wstring& cmdLine, DWORD timeoutMs = 30000) {
     if (cmdLine.empty()) return "";
-
+    
     SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
     HANDLE hReadPipe = NULL, hWritePipe = NULL;
     if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return "";
-
+    
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOW si = { sizeof(si) };
@@ -247,7 +196,7 @@ std::string RunProcessCapture(const std::wstring& cmdLine, DWORD timeoutMs = 300
     si.hStdError = hWritePipe;
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi;
-
+    
     HANDLE hJob = CreateJobObjectW(NULL, NULL);
     if (hJob) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
@@ -257,7 +206,7 @@ std::string RunProcessCapture(const std::wstring& cmdLine, DWORD timeoutMs = 300
 
     std::wstring cmd = cmdLine;
     std::string output;
-
+    
     if (CreateProcessW(NULL, &cmd[0], NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         if (hJob) {
             if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
@@ -267,15 +216,15 @@ std::string RunProcessCapture(const std::wstring& cmdLine, DWORD timeoutMs = 300
         ResumeThread(pi.hThread);
         CloseHandle(hWritePipe);
         hWritePipe = NULL;
-
+        
         char buffer[4096];
         DWORD bytesRead;
         ULONGLONG startTime = GetTickCount64();
-
+        
         while (true) {
             DWORD available = 0;
             if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &available, NULL)) break;
-
+            
             if (available > 0) {
                 if (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
                     buffer[bytesRead] = '\0';
@@ -296,11 +245,11 @@ std::string RunProcessCapture(const std::wstring& cmdLine, DWORD timeoutMs = 300
                 Sleep(10);
             }
         }
-
+        
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
-
+    
     CloseHandle(hReadPipe);
     if (hWritePipe) CloseHandle(hWritePipe);
     if (hJob) CloseHandle(hJob);
@@ -310,16 +259,11 @@ std::string RunProcessCapture(const std::wstring& cmdLine, DWORD timeoutMs = 300
 fs::path GetDesktopPath() {
     PWSTR path = NULL;
     fs::path result;
-    if (SUCCEEDED(SHGetKnownFolderPath(kFolderIdDesktop, 0, NULL, &path))) {
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, NULL, &path))) {
         result = path;
         CoTaskMemFree(path);
     }
     return result;
-}
-
-bool EqPathI(const std::wstring& a, const std::wstring& b) {
-    int res = CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE);
-    return res == CSTR_EQUAL;
 }
 
 bool IsSafePath(const fs::path& p, const fs::path& userProfile) {
@@ -331,28 +275,21 @@ bool IsSafePath(const fs::path& p, const fs::path& userProfile) {
     auto depth = std::distance(np.begin(), np.end());
     if (depth < 3) return false;
 
-    // Защищаемые пути - из реальных переменных окружения (а не хардкод c:\...).
-    std::vector<std::wstring> protectedPaths;
-    auto pushEnv = [&](const wchar_t* name) {
-        std::wstring v = GetEnvVarW(name);
-        if (!v.empty()) {
-            if (v.back() == L'\\') v.pop_back();
-            protectedPaths.push_back(v);
-        }
+    auto Eq = [](const std::wstring& a, const std::wstring& b) {
+        int res = CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE);
+        if (res == 0) return true;
+        return res == CSTR_EQUAL;
     };
-    pushEnv(L"SystemRoot");
-    pushEnv(L"ProgramFiles");
-    pushEnv(L"ProgramFiles(x86)");
-    pushEnv(L"ProgramData");
-    pushEnv(L"ProgramW6432"); // на случай 32-битной сборки в 64-битной системе
 
-    for (const auto& pp : protectedPaths) {
-        if (EqPathI(wpath, pp)) return false;
+    if (Eq(wpath, L"c:\\windows") || Eq(wpath, L"c:\\program files") ||
+        Eq(wpath, L"c:\\program files (x86)") || Eq(wpath, L"c:\\programdata") ||
+        Eq(wpath, L"c:\\users")) {
+        return false;
     }
     if (!userProfile.empty()) {
         std::wstring uProf = userProfile.wstring();
         if (!uProf.empty() && uProf.back() == L'\\') uProf.pop_back();
-        if (EqPathI(wpath, uProf)) return false;
+        if (Eq(wpath, uProf)) return false;
     }
     return true;
 }
@@ -372,26 +309,16 @@ uintmax_t GetSize(const fs::path& path) {
     std::error_code ec;
     if (!fs::exists(path, ec)) return 0;
     try {
-        if (IsReparsePoint(path)) return 0; // не считаем и не лезем внутрь
+        if (fs::is_symlink(fs::symlink_status(path, ec))) return 0;
         if (fs::is_regular_file(path, ec)) return fs::file_size(path, ec);
         if (fs::is_directory(path, ec)) {
-            fs::recursive_directory_iterator it(
-                path, fs::directory_options::skip_permission_denied, ec);
-            fs::recursive_directory_iterator end;
-            while (it != end) {
-                if (ec) { ec.clear(); it.increment(ec); continue; }
-                const fs::path ep = it->path();
-                std::error_code st_ec;
-                // Junction/symlink: не считаем содержимое и не спускаемся внутрь.
-                if (IsReparsePoint(ep)) {
-                    if (it->is_directory(st_ec)) it.disable_recursion_pending();
-                    it.increment(ec);
-                    continue;
+            for (const auto& entry : fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied, ec)) {
+                if (ec) { ec.clear(); continue; }
+                if (entry.is_symlink(ec)) continue;
+                if (entry.is_regular_file(ec)) {
+                    size += entry.file_size(ec);
+                    if (ec) { ec.clear(); }
                 }
-                if (it->is_regular_file(st_ec)) {
-                    size += it->file_size(st_ec);
-                }
-                it.increment(ec);
             }
         }
     } catch (...) {}
@@ -402,35 +329,26 @@ uintmax_t CleanPath(const fs::path& path) {
     std::error_code ec;
     uintmax_t freed = 0;
     if (!fs::exists(path, ec)) return 0;
-
-    if (IsReparsePoint(path)) {
-        std::cout << "[WARN] Reparse point пропущен: " << WStringToString(path.wstring()) << "\n";
+    if (fs::is_symlink(fs::symlink_status(path, ec))) {
+        std::cout << "[WARN] Симлинк пропущен: " << WStringToString(path.wstring()) << "\n";
         return 0;
     }
-
     if (fs::is_regular_file(path, ec)) {
         freed = fs::file_size(path, ec);
         fs::remove(path, ec);
-        return ec ? 0 : freed;
+        return freed;
     }
-
     if (fs::is_directory(path, ec)) {
         for (const auto& entry : fs::directory_iterator(path, ec)) {
             if (ec) { ec.clear(); continue; }
             std::error_code rm_ec;
-
-            // Reparse point внутри кэша: удаляем только саму ссылку,
-            // содержимое за ней не трогаем.
-            if (IsReparsePoint(entry.path())) {
+            if (entry.is_symlink(rm_ec)) {
                 fs::remove(entry.path(), rm_ec);
                 continue;
             }
-
-            // Честная статистика: меряем до удаления, включая подпапки.
-            uintmax_t before = GetSize(entry.path());
+            uintmax_t f_size = fs::is_regular_file(entry, rm_ec) ? fs::file_size(entry, rm_ec) : 0;
             fs::remove_all(entry.path(), rm_ec);
-            uintmax_t after = rm_ec ? GetSize(entry.path()) : 0;
-            if (after < before) freed += (before - after);
+            if (!rm_ec) freed += f_size;
         }
     }
     return freed;
@@ -440,7 +358,7 @@ uintmax_t CleanPath(const fs::path& path) {
 
 void RunFstrimAllDistros() {
     std::cout << "[*] Очистка неиспользуемых блоков (fstrim) во всех WSL-дистрибутивах...\n";
-
+    
     std::string raw = RunProcessCapture(L"wsl.exe -l -q", 15000);
     if (raw.empty()) {
         std::cout << "  [!] WSL не установлен или не вернул список дистрибутивов.\n";
@@ -467,9 +385,9 @@ void RunFstrimAllDistros() {
         distro.erase(std::remove(distro.begin(), distro.end(), L'\r'), distro.end());
         while (!distro.empty() && iswspace(distro.back())) distro.pop_back();
         while (!distro.empty() && iswspace(distro.front())) distro.erase(0, 1);
-
+        
         if (distro.empty()) continue;
-
+        
         std::cout << "  -> fstrim в " << WStringToString(distro) << "... ";
         std::cout.flush();
 
@@ -482,11 +400,11 @@ void RunFstrimAllDistros() {
 
         std::wstring cmd = L"wsl.exe -d \"" + safeDistro + L"\" -u root fstrim -av";
         DWORD code = RunProcess(cmd, 60000);
-
+        
         if (code == 0) std::cout << "[OK]\n";
         else if (code == PROCESS_LAUNCH_FAILED) std::cout << "[FAIL] Процесс не запустился\n";
         else std::cout << "[FAIL/ПРОПУСК] код: " << code << "\n";
-
+        
         count++;
     }
 
@@ -572,12 +490,12 @@ void CompactVHDX(bool dryRun) {
 
     for (const auto& v : vhdxFiles) {
         std::cout << "  -> Сжимаю: " << WStringToString(v.filename().wstring()) << "...\n";
-
+        
         uintmax_t size_before = fs::exists(v, ec) ? fs::file_size(v, ec) : 0;
-        uintmax_t free_space = GetFreeBytesOnVolume(v);
-
+        uintmax_t free_space = GetFreeSpace(v);
+        
         if (free_space < size_before + (100ULL * 1024 * 1024)) {
-            std::cout << "     [!] Мало свободного места (" << FormatSize(free_space)
+            std::cout << "     [!] Мало свободного места (" << FormatSize(free_space) 
                       << "). -Mode Full может упасть. Пропуск.\n";
             continue;
         }
@@ -588,10 +506,10 @@ void CompactVHDX(bool dryRun) {
             wp.replace(pos, 1, L"''");
             pos += 2;
         }
-
+        
         std::wstring psCmd = L"powershell.exe -NoProfile -Command \"Optimize-VHD -Path '" + wp + L"' -Mode Full\"";
         DWORD exitCode = RunProcess(psCmd, 45 * 60 * 1000);
-
+        
         if (exitCode == 0) {
             uintmax_t size_after = fs::exists(v, ec) ? fs::file_size(v, ec) : 0;
             if (size_before > size_after) {
@@ -607,7 +525,7 @@ void CompactVHDX(bool dryRun) {
             std::cout << "     [FAIL] Exit code: " << exitCode << "\n";
         }
     }
-
+    
     std::cout << "[+] Сжатие завершено. WSL будет перезапущен при следующем вызове.\n";
 }
 
@@ -638,7 +556,7 @@ int main(int argc, char** argv) {
 
     try {
         bool isAdmin = IsAdmin();
-        std::cout << "=== МЕГА-ОЧИСТЧИК КЭШЕЙ (v13.0 SAFE_REV) ===\n";
+        std::cout << "=== МЕГА-ОЧИСТЧИК КЭШЕЙ (v13.0 SAFE_EDITION) ===\n";
         std::cout << "Режим: " << (dryRun ? "DRY-RUN (только отчет)\n" : "РЕАЛЬНОЕ УДАЛЕНИЕ\n");
         std::cout << "Права администратора: " << (isAdmin ? "ДА" : "НЕТ (системные кэши пропущены)") << "\n";
 
@@ -662,37 +580,19 @@ int main(int argc, char** argv) {
             {L"VS Code Cache", fs::path(appData) / L"Code" / L"Cache", Trust::SAFE},
             {L"VS Code Code Cache", fs::path(appData) / L"Code" / L"Code Cache", Trust::SAFE},
             {L"PS CameraRaw Cache", fs::path(localAppData) / L"Adobe" / L"CameraRaw" / L"Cache", Trust::SAFE},
+            {L"PS Media Cache", fs::path(localAppData) / L"Adobe" / L"Photoshop" / L"CT", Trust::SAFE},
             {L"Python (pip)", fs::path(localAppData) / L"pip" / L"Cache", Trust::REBUILDABLE},
             {L"Node.js (npm Local)", fs::path(localAppData) / L"npm-cache", Trust::REBUILDABLE},
             {L"Node.js (npm Roaming)", fs::path(appData) / L"npm-cache", Trust::REBUILDABLE},
             {L"Java (Maven)", fs::path(userProfile) / L".m2" / L"repository", Trust::REBUILDABLE},
             {L"Java (Gradle)", fs::path(userProfile) / L".gradle" / L"caches", Trust::REBUILDABLE},
-            {L"C++ (NuGet)", fs::path(userProfile) / L".nuget" / L"packages", Trust::REBUILDABLE},
-            {L"Ollama Models", fs::path(userProfile) / L".ollama" / L"models", Trust::DATA}
+            {L"C++ (NuGet)", fs::path(userProfile) / L".nuget" / L"packages", Trust::REBUILDABLE}
         };
 
         if (isAdmin) {
             targets.push_back({L"Windows Temp", fs::path(winDir) / L"Temp", Trust::SAFE});
             targets.push_back({L"Windows Prefetch (замедлит 1-й запуск)", fs::path(winDir) / L"Prefetch", Trust::SAFE});
             targets.push_back({L"Win Update Download", fs::path(winDir) / L"SoftwareDistribution" / L"Download", Trust::SAFE});
-        }
-
-        // Предупреждение о запущенных приложениях (их файлы залочены).
-        {
-            const std::pair<const wchar_t*, const wchar_t*> checks[] = {
-                {L"chrome.exe",   L"Google Chrome"},
-                {L"msedge.exe",   L"Microsoft Edge"},
-                {L"browser.exe",  L"Yandex Browser"},
-                {L"opera.exe",    L"Opera"},
-                {L"Discord.exe",  L"Discord"},
-                {L"Code.exe",     L"VS Code"},
-            };
-            for (const auto& c : checks) {
-                if (IsProcessRunning(c.first)) {
-                    std::cout << "[!] Запущен " << WStringToString(c.second)
-                              << " - его кэш залочен и будет пропущен/очищен частично.\n";
-                }
-            }
         }
 
         uintmax_t total_found = 0;
@@ -705,9 +605,9 @@ int main(int argc, char** argv) {
                 std::cout << "  [WARN] Пропуск (небезопасный путь): " << WStringToString(target.name) << "\n";
                 continue;
             }
-
+            
             std::cout << "  -> Проверяю: " << WStringToString(target.name) << "...\n";
-
+            
             if (fs::exists(target.path)) {
                 target.size_before = GetSize(target.path);
                 if (target.size_before > 20 * 1024 * 1024) {
@@ -721,34 +621,34 @@ int main(int argc, char** argv) {
         if (found_targets.empty()) {
             std::cout << "[+] Мусора больше 20 МБ не найдено!\n";
         } else {
-            std::cout << "\n" << std::left << std::setw(max_name_len + 2) << "Инструмент"
+            std::cout << "\n" << std::left << std::setw(max_name_len + 2) << "Инструмент" 
                       << std::setw(12) << "Уровень" << std::setw(12) << "Размер" << "| Путь\n";
             std::cout << std::string(80 + max_name_len, '-') << "\n";
 
             for (const auto& t : found_targets) {
                 std::cout << std::left << std::setw(max_name_len + 2) << WStringToString(t.name)
                           << std::setw(12) << TrustToString(t.trust)
-                          << std::setw(12) << FormatSize(t.size_before)
+                          << std::setw(12) << FormatSize(t.size_before) 
                           << "| " << WStringToString(t.path.wstring()) << "\n";
             }
             std::cout << std::string(80 + max_name_len, '-') << "\n";
             std::cout << "ПОТЕНЦИАЛ: " << FormatSize(total_found) << "\n";
 
             if (!dryRun) {
-                std::cout << "\n[?] Введите 'y' (SAFE+REBUILD), 'a' (ВСЁ, включая DATA) или 'n' (отмена): ";
+                std::cout << "\n[?] Введите 'y' (Удалить найденный кэш) или 'n' (отмена): ";
                 std::string answer;
                 std::getline(std::cin, answer);
                 std::transform(answer.begin(), answer.end(), answer.begin(), [](unsigned char c){ return std::tolower(c); });
 
-                if (answer == "y" || answer == "a") {
+                if (answer == "y" || answer == "yes") {
                     std::cout << "\n[*] Зачистка...\n";
-
+                    
                     auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
                     struct tm tstruct;
                     localtime_s(&tstruct, &now);
                     char buf[80];
                     strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S_cleanup_log.txt", &tstruct);
-
+                    
                     fs::path desktop = GetDesktopPath();
                     if (desktop.empty()) desktop = userProfile;
                     fs::path logPath = desktop / buf;
@@ -759,15 +659,10 @@ int main(int argc, char** argv) {
 
                     uintmax_t actually_freed = 0;
                     for (auto& t : found_targets) {
-                        if (t.trust == Trust::DATA && answer != "a") {
-                            std::cout << "  -> " << WStringToString(t.name) << " [ПРОПУЩЕН: DATA]\n";
-                            continue;
-                        }
-
                         std::cout << "  -> " << WStringToString(t.name) << "... ";
                         CleanPath(t.path);
                         t.size_after = GetSize(t.path);
-
+                        
                         uintmax_t freed = (t.size_before > t.size_after) ? (t.size_before - t.size_after) : 0;
                         actually_freed += freed;
 
@@ -776,16 +671,16 @@ int main(int argc, char** argv) {
                         else std::cout << "[OK] Освобождено: " << FormatSize(freed) << "\n";
 
                         if (log) {
-                            log << WStringToString(t.name) << " | " << TrustToString(t.trust)
+                            log << WStringToString(t.name) << " | " << TrustToString(t.trust) 
                                 << " | " << FormatSize(freed) << "\n";
                         }
                     }
-
+                    
                     std::cout << "\n[+] РЕАЛЬНО ОСВОБОЖДЕНО: " << FormatSize(actually_freed) << "\n";
                     if (log) {
                         log << "=== ИТОГО: " << FormatSize(actually_freed) << " ===\n";
                         log.close();
-                        std::cout << "[+] Лог сохранен: " << WStringToString(logPath.wstring()) << "\n";
+                        std::cout << "[+] Лог сохранен: " << logPath.filename().string() << " (на Рабочем столе)\n";
                     }
                 } else {
                     std::cout << "\n[-] Отменено.\n";
